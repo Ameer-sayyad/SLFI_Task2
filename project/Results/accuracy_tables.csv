@@ -1,0 +1,4 @@
+Model,Accuracy
+Speech (HuBERT + BiLSTM),0.9089
+Text (BERT),0.2759
+Fusion (Speech + Text),0.3821
