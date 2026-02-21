@@ -1,24 +1,32 @@
+# ==============================
+# SPEECH PIPELINE TRAIN
+# HuBERT + BiLSTM
+# ==============================
 
 import os
 import torch
 import torch.nn as nn
-from sklearn.metrics import accuracy_score, classification_report
+import numpy as np
+from tqdm import tqdm
+from sklearn.metrics import accuracy_score
+from transformers import HubertModel, Wav2Vec2FeatureExtractor
+import librosa
 
-# ---------------------------
-# PATHS
-# ---------------------------
-model_path = "/content/drive/MyDrive/project/models/speech_pipeline/speech_model.pt"
-test_embed_dir = "/content/drive/MyDrive/Speech_Emotion_Project/hubert_test_embeddings"
-test_split_path = "/content/drive/MyDrive/Speech_Emotion_Project/TESS_SPLIT/test"
+# ------------------------------
+# Paths
+# ------------------------------
+train_base = "/content/TESS_SPLIT/train"
+test_base  = "/content/TESS_SPLIT/test"
 
-# ---------------------------
-# DEVICE
-# ---------------------------
-device = "cuda" if torch.cuda.is_available() else "cpu"
+hubert_train_dir = "/content/New_Project_pipeline/hubert_train_embeddings"
+hubert_test_dir  = "/content/New_Project_pipeline/hubert_test_embeddings"
 
-# ---------------------------
-# EMOTION MAP
-# ---------------------------
+os.makedirs(hubert_train_dir, exist_ok=True)
+os.makedirs(hubert_test_dir, exist_ok=True)
+
+# ------------------------------
+# Emotion mapping
+# ------------------------------
 emotion_map = {
     "angry":0,
     "disgust":1,
@@ -29,63 +37,126 @@ emotion_map = {
     "neutral":6
 }
 
-# ---------------------------
-# LOAD TEST DATA
-# ---------------------------
-test_paths = []
-test_labels = []
+# ------------------------------
+# Load train paths
+# ------------------------------
+train_paths, train_labels = [], []
 
-for emo in os.listdir(test_split_path):
-    emo_path = os.path.join(test_split_path, emo)
-
+for emo in os.listdir(train_base):
+    emo_path = os.path.join(train_base, emo)
     for file in os.listdir(emo_path):
-        test_paths.append(os.path.join(emo_path, file))
-        test_labels.append(emotion_map[emo])
+        train_paths.append(os.path.join(emo_path, file))
+        train_labels.append(emotion_map[emo])
 
-# ---------------------------
-# LOAD EMBEDDINGS
-# ---------------------------
-def load_test_embedding(path):
-    file_name = path.split("/")[-1].replace(".wav",".pt")
-    return torch.load(os.path.join(test_embed_dir,file_name))
+print("Train samples:", len(train_paths))
 
-# ---------------------------
-# MODEL
-# ---------------------------
+# ------------------------------
+# Device
+# ------------------------------
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ------------------------------
+# Load HuBERT
+# ------------------------------
+feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained("facebook/hubert-base-ls960")
+hubert_model = HubertModel.from_pretrained("facebook/hubert-base-ls960").to(device)
+
+# ------------------------------
+# HuBERT extraction
+# ------------------------------
+def extract_hubert(audio_path):
+    speech, sr = librosa.load(audio_path, sr=16000)
+
+    inputs = feature_extractor(
+        speech,
+        sampling_rate=16000,
+        return_tensors="pt",
+        padding=True
+    )
+
+    input_values = inputs.input_values.to(device)
+
+    with torch.no_grad():
+        outputs = hubert_model(input_values)
+
+    return outputs.last_hidden_state.squeeze(0).cpu()
+
+# ------------------------------
+# Save embeddings
+# ------------------------------
+for path in tqdm(train_paths):
+    emb = extract_hubert(path)
+    file_name = path.split("/")[-1].replace(".wav", ".pt")
+    torch.save(emb, os.path.join(hubert_train_dir, file_name))
+
+# ------------------------------
+# Load embeddings
+# ------------------------------
+def load_train_embedding(path):
+    file_name = path.split("/")[-1].replace(".wav", ".pt")
+    return torch.load(os.path.join(hubert_train_dir, file_name))
+
+# ------------------------------
+# BiLSTM Model
+# ------------------------------
 class EmotionBiLSTM(nn.Module):
-    def __init__(self,input_dim=768,hidden_dim=128,num_layers=1,num_classes=7):
+    def __init__(self):
         super().__init__()
-        self.lstm = nn.LSTM(input_dim,hidden_dim,
-                            num_layers=num_layers,
-                            bidirectional=True,
-                            batch_first=True)
-        self.fc = nn.Linear(hidden_dim*2,num_classes)
 
-    def forward(self,x):
-        out,_ = self.lstm(x)
-        out = out[:,-1,:]
-        return self.fc(out)
+        self.lstm = nn.LSTM(
+            input_size=768,
+            hidden_size=128,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True
+        )
 
+        self.fc = nn.Linear(256, 7)
+
+    def forward(self, x):
+        x = x.unsqueeze(0)         # [1,T,768]
+        out, _ = self.lstm(x)      # [1,T,256]
+        pooled = out.mean(dim=1)   # [1,256]
+        output = self.fc(pooled)   # [1,7]
+        return output
+
+# ------------------------------
+# Training setup
+# ------------------------------
 model = EmotionBiLSTM().to(device)
-model.load_state_dict(torch.load(model_path))
-model.eval()
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
-# ---------------------------
-# TEST LOOP
-# ---------------------------
-preds = []
+epochs = 23
 
-for path in test_paths:
-    features = load_test_embedding(path).unsqueeze(0).to(device)
-    outputs = model(features)
-    pred = torch.argmax(outputs,dim=1).item()
-    preds.append(pred)
+# ------------------------------
+# Training loop
+# ------------------------------
+for epoch in range(epochs):
 
-# ---------------------------
-# RESULTS
-# ---------------------------
-acc = accuracy_score(test_labels,preds)
+    model.train()
+    total_loss = 0
 
-print("Speech Test Accuracy:",acc)
-print("\nClassification Report:\n")
-print(classification_report(test_labels,preds))
+    for path, label in zip(train_paths, train_labels):
+
+        features = load_train_embedding(path).to(device)
+        label_tensor = torch.tensor([label]).to(device)
+
+        outputs = model(features)
+        loss = criterion(outputs, label_tensor)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    print(f"Epoch {epoch+1} Loss:", total_loss)
+
+# ------------------------------
+# Save trained model
+# ------------------------------
+torch.save(model.state_dict(),
+           "/content/New_Project_pipeline/speech_model.pt")
+
+print("Speech model training complete.")
