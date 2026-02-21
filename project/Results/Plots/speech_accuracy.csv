@@ -1,0 +1,2 @@
+Model,Accuracy
+Speech (HuBERT + BiLSTM),0.9089285714285714
