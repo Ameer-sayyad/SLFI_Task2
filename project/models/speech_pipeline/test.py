@@ -1,32 +1,25 @@
 # ==============================
-# SPEECH PIPELINE TRAIN
-# HuBERT + BiLSTM
+# SPEECH PIPELINE TEST
 # ==============================
 
 import os
 import torch
 import torch.nn as nn
 import numpy as np
-from tqdm import tqdm
-from sklearn.metrics import accuracy_score
-from transformers import HubertModel, Wav2Vec2FeatureExtractor
-import librosa
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.manifold import TSNE
 
 # ------------------------------
 # Paths
 # ------------------------------
-train_base = "/content/TESS_SPLIT/train"
-test_base  = "/content/TESS_SPLIT/test"
+test_base = "/content/TESS_SPLIT/test"
+hubert_test_dir = "/content/New_Project_pipeline/hubert_test_embeddings"
 
-hubert_train_dir = "/content/New_Project_pipeline/hubert_train_embeddings"
-hubert_test_dir  = "/content/New_Project_pipeline/hubert_test_embeddings"
+results_dir = "/content/New_Project_pipeline/results_speech"
+os.makedirs(results_dir, exist_ok=True)
 
-os.makedirs(hubert_train_dir, exist_ok=True)
-os.makedirs(hubert_test_dir, exist_ok=True)
-
-# ------------------------------
-# Emotion mapping
-# ------------------------------
 emotion_map = {
     "angry":0,
     "disgust":1,
@@ -37,67 +30,30 @@ emotion_map = {
     "neutral":6
 }
 
-# ------------------------------
-# Load train paths
-# ------------------------------
-train_paths, train_labels = [], []
+emotion_names = list(emotion_map.keys())
 
-for emo in os.listdir(train_base):
-    emo_path = os.path.join(train_base, emo)
+# ------------------------------
+# Load test paths
+# ------------------------------
+test_paths, test_labels = [], []
+
+for emo in os.listdir(test_base):
+    emo_path = os.path.join(test_base, emo)
     for file in os.listdir(emo_path):
-        train_paths.append(os.path.join(emo_path, file))
-        train_labels.append(emotion_map[emo])
+        test_paths.append(os.path.join(emo_path, file))
+        test_labels.append(emotion_map[emo])
 
-print("Train samples:", len(train_paths))
-
-# ------------------------------
-# Device
-# ------------------------------
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
-# ------------------------------
-# Load HuBERT
-# ------------------------------
-feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained("facebook/hubert-base-ls960")
-hubert_model = HubertModel.from_pretrained("facebook/hubert-base-ls960").to(device)
-
-# ------------------------------
-# HuBERT extraction
-# ------------------------------
-def extract_hubert(audio_path):
-    speech, sr = librosa.load(audio_path, sr=16000)
-
-    inputs = feature_extractor(
-        speech,
-        sampling_rate=16000,
-        return_tensors="pt",
-        padding=True
-    )
-
-    input_values = inputs.input_values.to(device)
-
-    with torch.no_grad():
-        outputs = hubert_model(input_values)
-
-    return outputs.last_hidden_state.squeeze(0).cpu()
-
-# ------------------------------
-# Save embeddings
-# ------------------------------
-for path in tqdm(train_paths):
-    emb = extract_hubert(path)
-    file_name = path.split("/")[-1].replace(".wav", ".pt")
-    torch.save(emb, os.path.join(hubert_train_dir, file_name))
+print("Test samples:", len(test_paths))
 
 # ------------------------------
 # Load embeddings
 # ------------------------------
-def load_train_embedding(path):
+def load_test_embedding(path):
     file_name = path.split("/")[-1].replace(".wav", ".pt")
-    return torch.load(os.path.join(hubert_train_dir, file_name))
+    return torch.load(os.path.join(hubert_test_dir, file_name))
 
 # ------------------------------
-# BiLSTM Model
+# Model definition
 # ------------------------------
 class EmotionBiLSTM(nn.Module):
     def __init__(self):
@@ -114,49 +70,84 @@ class EmotionBiLSTM(nn.Module):
         self.fc = nn.Linear(256, 7)
 
     def forward(self, x):
-        x = x.unsqueeze(0)         # [1,T,768]
-        out, _ = self.lstm(x)      # [1,T,256]
-        pooled = out.mean(dim=1)   # [1,256]
-        output = self.fc(pooled)   # [1,7]
+        x = x.unsqueeze(0)
+        out, _ = self.lstm(x)
+        pooled = out.mean(dim=1)
+        output = self.fc(pooled)
         return output
 
 # ------------------------------
-# Training setup
+# Load model
 # ------------------------------
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
 model = EmotionBiLSTM().to(device)
-criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-
-epochs = 23
+model.load_state_dict(torch.load(
+    "/content/New_Project_pipeline/speech_model.pt",
+    map_location=device
+))
+model.eval()
 
 # ------------------------------
-# Training loop
+# Testing
 # ------------------------------
-for epoch in range(epochs):
+preds = []
+features_tsne = []
 
-    model.train()
-    total_loss = 0
+for path in test_paths:
 
-    for path, label in zip(train_paths, train_labels):
+    features = load_test_embedding(path).to(device)
 
-        features = load_train_embedding(path).to(device)
-        label_tensor = torch.tensor([label]).to(device)
-
+    with torch.no_grad():
         outputs = model(features)
-        loss = criterion(outputs, label_tensor)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+    pred = torch.argmax(outputs, dim=1).item()
+    preds.append(pred)
 
-        total_loss += loss.item()
-
-    print(f"Epoch {epoch+1} Loss:", total_loss)
+    features_tsne.append(features.mean(dim=0).numpy())
 
 # ------------------------------
-# Save trained model
+# Metrics
 # ------------------------------
-torch.save(model.state_dict(),
-           "/content/New_Project_pipeline/speech_model.pt")
+acc = accuracy_score(test_labels, preds)
+print("Speech Accuracy:", acc)
+print("\nClassification Report:\n")
+print(classification_report(test_labels, preds))
 
-print("Speech model training complete.")
+# Save report
+with open(os.path.join(results_dir, "speech_report.txt"), "w") as f:
+    f.write(classification_report(test_labels, preds))
+
+# ------------------------------
+# Confusion Matrix
+# ------------------------------
+cm = confusion_matrix(test_labels, preds)
+
+plt.figure(figsize=(8,6))
+sns.heatmap(cm, annot=True, fmt="d",
+            xticklabels=emotion_names,
+            yticklabels=emotion_names)
+
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.title("Speech Confusion Matrix")
+plt.savefig(os.path.join(results_dir, "speech_confusion.png"))
+plt.close()
+
+# ------------------------------
+# t-SNE Visualization
+# ------------------------------
+tsne = TSNE(n_components=2, random_state=42)
+features_2d = tsne.fit_transform(np.array(features_tsne))
+
+plt.figure(figsize=(10,8))
+for i, emo in enumerate(emotion_names):
+    idx = np.where(np.array(test_labels) == i)
+    plt.scatter(features_2d[idx,0], features_2d[idx,1], label=emo)
+
+plt.legend()
+plt.title("Speech t-SNE Representation")
+plt.savefig(os.path.join(results_dir, "speech_tsne.png"))
+plt.close()
+
+print("Speech testing complete.")
