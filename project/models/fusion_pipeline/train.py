@@ -1,25 +1,24 @@
+# ==========================================
+# FUSION PIPELINE TRAIN
+# Speech (HuBERT + BiLSTM) + Text (BERT)
+# ==========================================
 
 import os
 import torch
 import torch.nn as nn
-from transformers import BertTokenizer, BertModel
+import numpy as np
 from tqdm import tqdm
+from transformers import BertTokenizer, BertModel
 
-# ---------------------------
+# ------------------------------
 # PATHS
-# ---------------------------
-train_split_path = "/content/drive/MyDrive/Speech_Emotion_Project/TESS_SPLIT/train"
-train_embed_dir = "/content/drive/MyDrive/Speech_Emotion_Project/hubert_train_embeddings"
-model_save_path = "/content/drive/MyDrive/project/models/fusion_pipeline/fusion_model.pt"
+# ------------------------------
+train_base = "/content/TESS_SPLIT/train"
+hubert_train_dir = "/content/New_Project_pipeline/hubert_train_embeddings"
 
-# ---------------------------
-# DEVICE
-# ---------------------------
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
-# ---------------------------
-# EMOTION MAP
-# ---------------------------
+# ------------------------------
+# Emotion Mapping
+# ------------------------------
 emotion_map = {
     "angry":0,
     "disgust":1,
@@ -30,79 +29,119 @@ emotion_map = {
     "neutral":6
 }
 
-# ---------------------------
-# LOAD TRAIN DATA
-# ---------------------------
-train_paths = []
-train_texts = []
-train_labels = []
+# ------------------------------
+# Load Train Data
+# ------------------------------
+train_paths, train_labels = [], []
 
-for emo in os.listdir(train_split_path):
-    emo_path = os.path.join(train_split_path, emo)
-
+for emo in os.listdir(train_base):
+    emo_path = os.path.join(train_base, emo)
     for file in os.listdir(emo_path):
-        path = os.path.join(emo_path, file)
-
-        word = file.split("_")[1]
-        sentence = f"say the word {word}"
-
-        train_paths.append(path)
-        train_texts.append(sentence)
+        train_paths.append(os.path.join(emo_path, file))
         train_labels.append(emotion_map[emo])
 
-# ---------------------------
-# LOAD EMBEDDINGS
-# ---------------------------
-def load_train_embedding(path):
-    file_name = path.split("/")[-1].replace(".wav",".pt")
-    return torch.load(os.path.join(train_embed_dir,file_name))
+# Build Text
+def build_text(path):
+    file = path.split("/")[-1]
+    word = file.split("_")[1]
+    return f"say the word {word}"
 
-# ---------------------------
-# LOAD BERT
-# ---------------------------
+train_texts = [build_text(p) for p in train_paths]
+
+# ------------------------------
+# Device
+# ------------------------------
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ------------------------------
+# Load Speech Model (BiLSTM feature extractor)
+# ------------------------------
+class EmotionBiLSTM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=768,
+            hidden_size=128,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True
+        )
+        self.fc = nn.Linear(256, 7)
+
+    def forward(self, x, return_features=False):
+        x = x.unsqueeze(0)
+        out, _ = self.lstm(x)
+        pooled = out.mean(dim=1)
+        if return_features:
+            return pooled
+        return self.fc(pooled)
+
+speech_model = EmotionBiLSTM().to(device)
+speech_model.load_state_dict(
+    torch.load("/content/New_Project_pipeline/speech_model.pt",
+               map_location=device)
+)
+speech_model.eval()
+
+# ------------------------------
+# Load BERT
+# ------------------------------
 tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
 bert_model = BertModel.from_pretrained("bert-base-uncased").to(device)
-bert_model.eval()
 
-# ---------------------------
-# FUSION MODEL
-# ---------------------------
-class FusionEmotionModel(nn.Module):
-    def __init__(self,speech_dim=768,text_dim=768,num_classes=7):
+for param in bert_model.parameters():
+    param.requires_grad = False
+
+# ------------------------------
+# Load HuBERT embeddings
+# ------------------------------
+def load_train_embedding(path):
+    file_name = path.split("/")[-1].replace(".wav", ".pt")
+    full_path = os.path.join(hubert_train_dir, file_name)
+    if os.path.exists(full_path):
+        return torch.load(full_path)
+    else:
+        return None
+
+# ------------------------------
+# Fusion Model (NO ReLU)
+# 1024 → 7
+# ------------------------------
+class FusionModel(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.fc1 = nn.Linear(speech_dim+text_dim,256)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(256,num_classes)
+        self.fc = nn.Linear(1024, 7)
 
-    def forward(self,speech_emb,text_emb):
-        fused = torch.cat((speech_emb,text_emb),dim=1)
-        x = self.fc1(fused)
-        x = self.relu(x)
-        x = self.fc2(x)
-        return x
+    def forward(self, speech_emb, text_emb):
+        fused = torch.cat((speech_emb, text_emb), dim=1)
+        return self.fc(fused)
 
-model = FusionEmotionModel().to(device)
+fusion_model = FusionModel().to(device)
+
 criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(),lr=1e-4)
+optimizer = torch.optim.Adam(fusion_model.parameters(), lr=1e-4)
 
-epochs = 12
+epochs = 20
 
-# ---------------------------
-# TRAIN LOOP
-# ---------------------------
+# ------------------------------
+# TRAINING LOOP
+# ------------------------------
 for epoch in range(epochs):
 
-    model.train()
+    fusion_model.train()
     total_loss = 0
 
-    for path,text,label in tqdm(zip(train_paths,train_texts,train_labels),
-                                total=len(train_paths)):
+    for path, text, label in zip(train_paths, train_texts, train_labels):
 
-        # speech embedding
-        speech_emb = load_train_embedding(path).unsqueeze(0).to(device)
-        speech_emb = speech_emb.mean(dim=1)
+        speech_frames = load_train_embedding(path)
+        if speech_frames is None:
+            continue
 
-        # text embedding
+        speech_frames = speech_frames.to(device)
+
+        with torch.no_grad():
+            speech_emb = speech_model(speech_frames, return_features=True)
+
         inputs = tokenizer(text,
                            return_tensors="pt",
                            truncation=True,
@@ -116,8 +155,8 @@ for epoch in range(epochs):
 
         label_tensor = torch.tensor([label]).to(device)
 
-        preds = model(speech_emb,text_emb)
-        loss = criterion(preds,label_tensor)
+        preds = fusion_model(speech_emb, text_emb)
+        loss = criterion(preds, label_tensor)
 
         optimizer.zero_grad()
         loss.backward()
@@ -125,10 +164,10 @@ for epoch in range(epochs):
 
         total_loss += loss.item()
 
-    print(f"Epoch {epoch+1} Loss:",total_loss)
+    print(f"Epoch {epoch+1} Loss:", total_loss)
 
-# ---------------------------
-# SAVE MODEL
-# ---------------------------
-torch.save(model.state_dict(),model_save_path)
-print("Fusion model saved.")
+# Save model
+torch.save(fusion_model.state_dict(),
+           "/content/New_Project_pipeline/fusion_model.pt")
+
+print("Fusion training complete.")
