@@ -43,9 +43,9 @@ Speech embeddings + Text embeddings → Dense → Emotion
 
 ## Results
 
-Speech Accuracy: 90.89%
+Speech Accuracy: 95.35%
 Text Accuracy: 14.59%
-Fusion Accuracy: 98.21%
+Fusion Accuracy: 98.57%
 
 ---
 
