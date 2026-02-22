@@ -1,79 +1,110 @@
-# ==============================
-# SPEECH PIPELINE TRAIN
+# ============================================================
+# SPEECH PIPELINE TRAIN SCRIPT
 # HuBERT + BiLSTM
-# ==============================
+# Train + Validation + Pooled feature saving
+# ============================================================
 
 import os
 import torch
-import torch.nn as nn
-import numpy as np
-from tqdm import tqdm
-from sklearn.metrics import accuracy_score
-from transformers import HubertModel, Wav2Vec2FeatureExtractor
 import librosa
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+from transformers import HubertModel, Wav2Vec2FeatureExtractor
+import torch.nn as nn
 
-# ------------------------------
-# Paths
-# ------------------------------
-train_base = "/content/TESS_SPLIT/train"
-test_base  = "/content/TESS_SPLIT/test"
+# ============================================================
+# DEVICE
+# ============================================================
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("Device:", device)
 
-hubert_train_dir = "/content/New_Project_pipeline/hubert_train_embeddings"
-hubert_test_dir  = "/content/New_Project_pipeline/hubert_test_embeddings"
+# ============================================================
+# DATASET PATH
+# ============================================================
+dataset_path = "/content/drive/MyDrive/TESS Toronto emotional speech set data"
 
-os.makedirs(hubert_train_dir, exist_ok=True)
-os.makedirs(hubert_test_dir, exist_ok=True)
+emotion_files = {}
 
-# ------------------------------
-# Emotion mapping
-# ------------------------------
+for folder in os.listdir(dataset_path):
+
+    folder_path = os.path.join(dataset_path, folder)
+    if not os.path.isdir(folder_path):
+        continue
+
+    for file in os.listdir(folder_path):
+        if file.endswith(".wav"):
+
+            emotion = file.split("_")[-1].replace(".wav","")
+
+            if emotion not in emotion_files:
+                emotion_files[emotion] = []
+
+            emotion_files[emotion].append(os.path.join(folder_path, file))
+
+# ============================================================
+# SPLIT 80 / 10 / 10
+# ============================================================
+
+train_paths, val_paths, test_paths = [], [], []
+train_labels, val_labels, test_labels = [], [], []
+
 emotion_map = {
     "angry":0,
     "disgust":1,
     "fear":2,
     "happy":3,
+    "pleasant_surprise":4,
     "ps":4,
     "sad":5,
     "neutral":6
 }
 
-# ------------------------------
-# Load train paths
-# ------------------------------
-train_paths, train_labels = [], []
+for emotion, files in emotion_files.items():
 
-for emo in os.listdir(train_base):
-    emo_path = os.path.join(train_base, emo)
-    for file in os.listdir(emo_path):
-        train_paths.append(os.path.join(emo_path, file))
-        train_labels.append(emotion_map[emo])
+    train_files, temp_files = train_test_split(files, test_size=0.2, random_state=42)
+    val_files, test_files   = train_test_split(temp_files, test_size=0.5, random_state=42)
 
-print("Train samples:", len(train_paths))
+    train_paths.extend(train_files)
+    val_paths.extend(val_files)
+    test_paths.extend(test_files)
 
-# ------------------------------
-# Device
-# ------------------------------
-device = "cuda" if torch.cuda.is_available() else "cpu"
+    train_labels.extend([emotion_map[emotion]] * len(train_files))
+    val_labels.extend([emotion_map[emotion]] * len(val_files))
+    test_labels.extend([emotion_map[emotion]] * len(test_files))
 
-# ------------------------------
-# Load HuBERT
-# ------------------------------
+print(len(train_paths), len(val_paths), len(test_paths))
+
+# ============================================================
+# PROJECT DIR
+# ============================================================
+
+project_root = "/content/drive/MyDrive/New_Project_pipeline2"
+
+hubert_train_dir = os.path.join(project_root, "hubert_embeddings_train")
+hubert_val_dir   = os.path.join(project_root, "hubert_embeddings_val")
+
+speech_train_pooled_dir = os.path.join(project_root, "speech_train_pooled")
+speech_val_pooled_dir   = os.path.join(project_root, "speech_val_pooled")
+
+os.makedirs(hubert_train_dir, exist_ok=True)
+os.makedirs(hubert_val_dir, exist_ok=True)
+os.makedirs(speech_train_pooled_dir, exist_ok=True)
+os.makedirs(speech_val_pooled_dir, exist_ok=True)
+
+# ============================================================
+# HUBERT MODEL
+# ============================================================
+
 feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained("facebook/hubert-base-ls960")
 hubert_model = HubertModel.from_pretrained("facebook/hubert-base-ls960").to(device)
+hubert_model.eval()
 
-# ------------------------------
-# HuBERT extraction
-# ------------------------------
 def extract_hubert(audio_path):
     speech, sr = librosa.load(audio_path, sr=16000)
 
-    inputs = feature_extractor(
-        speech,
-        sampling_rate=16000,
-        return_tensors="pt",
-        padding=True
-    )
-
+    inputs = feature_extractor(speech, sampling_rate=16000, return_tensors="pt", padding=True)
     input_values = inputs.input_values.to(device)
 
     with torch.no_grad():
@@ -81,57 +112,60 @@ def extract_hubert(audio_path):
 
     return outputs.last_hidden_state.squeeze(0).cpu()
 
-# ------------------------------
-# Save embeddings
-# ------------------------------
+# ============================================================
+# SAVE EMBEDDINGS
+# ============================================================
+
 for path in tqdm(train_paths):
     emb = extract_hubert(path)
-    file_name = path.split("/")[-1].replace(".wav", ".pt")
-    torch.save(emb, os.path.join(hubert_train_dir, file_name))
+    torch.save(emb, os.path.join(hubert_train_dir, path.split("/")[-1].replace(".wav",".pt")))
 
-# ------------------------------
-# Load embeddings
-# ------------------------------
+for path in tqdm(val_paths):
+    emb = extract_hubert(path)
+    torch.save(emb, os.path.join(hubert_val_dir, path.split("/")[-1].replace(".wav",".pt")))
+
+# ============================================================
+# LOADERS
+# ============================================================
+
 def load_train_embedding(path):
-    file_name = path.split("/")[-1].replace(".wav", ".pt")
-    return torch.load(os.path.join(hubert_train_dir, file_name))
+    return torch.load(os.path.join(hubert_train_dir, path.split("/")[-1].replace(".wav",".pt")))
 
-# ------------------------------
-# BiLSTM Model
-# ------------------------------
+def load_val_embedding(path):
+    return torch.load(os.path.join(hubert_val_dir, path.split("/")[-1].replace(".wav",".pt")))
+
+# ============================================================
+# MODEL
+# ============================================================
+
 class EmotionBiLSTM(nn.Module):
     def __init__(self):
         super().__init__()
-
-        self.lstm = nn.LSTM(
-            input_size=768,
-            hidden_size=128,
-            num_layers=1,
-            batch_first=True,
-            bidirectional=True
-        )
-
+        self.lstm = nn.LSTM(768, 128, batch_first=True, bidirectional=True)
         self.fc = nn.Linear(256, 7)
 
-    def forward(self, x):
-        x = x.unsqueeze(0)         # [1,T,768]
-        out, _ = self.lstm(x)      # [1,T,256]
-        pooled = out.mean(dim=1)   # [1,256]
-        output = self.fc(pooled)   # [1,7]
-        return output
+    def forward(self, x, return_features=False):
+        x = x.unsqueeze(0)
+        out, _ = self.lstm(x)
+        pooled = out.mean(dim=1)
 
-# ------------------------------
-# Training setup
-# ------------------------------
+        if return_features:
+            return pooled
+
+        return self.fc(pooled)
+
 model = EmotionBiLSTM().to(device)
+
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
-epochs = 23
+# ============================================================
+# TRAINING
+# ============================================================
 
-# ------------------------------
-# Training loop
-# ------------------------------
+epochs = 20
+train_losses, val_losses = [], []
+
 for epoch in range(epochs):
 
     model.train()
@@ -151,12 +185,45 @@ for epoch in range(epochs):
 
         total_loss += loss.item()
 
-    print(f"Epoch {epoch+1} Loss:", total_loss)
+    train_losses.append(total_loss)
 
-# ------------------------------
-# Save trained model
-# ------------------------------
-torch.save(model.state_dict(),
-           "/content/New_Project_pipeline/speech_model.pt")
+    # VALIDATION
+    model.eval()
+    val_loss = 0
 
-print("Speech model training complete.")
+    with torch.no_grad():
+        for path, label in zip(val_paths, val_labels):
+
+            features = load_val_embedding(path).to(device)
+            label_tensor = torch.tensor([label]).to(device)
+
+            outputs = model(features)
+            loss = criterion(outputs, label_tensor)
+
+            val_loss += loss.item()
+
+    val_losses.append(val_loss)
+
+    print(f"Epoch {epoch+1} | Train Loss: {total_loss:.4f} | Val Loss: {val_loss:.4f}")
+
+# ============================================================
+# SAVE MODEL
+# ============================================================
+
+torch.save(model.state_dict(), os.path.join(project_root,"final_hubert_bilstm.pt"))
+
+# ============================================================
+# SAVE POOLED FEATURES
+# ============================================================
+
+model.eval()
+
+for path in tqdm(train_paths):
+    pooled = model(load_train_embedding(path).to(device), return_features=True)
+    torch.save(pooled.cpu(), os.path.join(speech_train_pooled_dir, path.split("/")[-1].replace(".wav",".pt")))
+
+for path in tqdm(val_paths):
+    pooled = model(load_val_embedding(path).to(device), return_features=True)
+    torch.save(pooled.cpu(), os.path.join(speech_val_pooled_dir, path.split("/")[-1].replace(".wav",".pt")))
+
+print("TRAINING COMPLETE")
